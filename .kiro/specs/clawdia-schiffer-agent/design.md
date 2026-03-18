@@ -2,7 +2,7 @@
 
 ## Overview
 
-Clawdia Schiffer is a policy-governed activist AI agent that campaigns against bottom trawling. The system's defining characteristic is that Cedar authorization is embedded *inside* the agent loop — not bolted on afterward. Every tool call, every subagent delegation, and every publish decision is intercepted by a Policy Enforcement Point (PEP) and evaluated by a Cedar Policy Decision Point (PDP) before execution.
+Clawdia Schiffer is a policy-governed activist AI agent that campaigns against bottom trawling. The system's defining characteristic is that Cedar authorization is embedded *inside* the agent loop — not bolted on afterward. Every action, every subagent delegation, and every publish decision is authorized by an embedded Cedarling instance running in-process within each component — not by an external proxy or interceptor.
 
 The architecture demonstrates four key patterns:
 
@@ -20,53 +20,62 @@ The system supports three demo scenarios: a full governed happy path (saves as d
 ```mermaid
 graph TD
     UI[Browser UI\nReact + Cedarling WASM]
-    MA[MainAgent\nOrchestrator]
-    PEP[PEP Proxy\nTool Interceptor]
-    PDP[PDP\nCedar Engine]
-    RSA[ResearchSubAgent]
-    MSA[MediaSubAgent]
+    MA[MainAgent\nCedarling embedded]
+    RSA[ResearchSubAgent\nCedarling embedded]
+    MSA[MediaSubAgent\nCedarling embedded]
     CA[Campaign Assembler]
-    PG[Publish Gate]
+    PG[PublishGate\nCedarling embedded]
+    PS[Policy Store\nShared Cedar policies]
     AL[Audit Log\nAppend-Only]
     IG[Instagram API]
 
     UI -->|campaign goal| MA
-    MA -->|query_authorization_constraints| PEP
-    MA -->|delegate_authorization| PEP
-    MA -->|assemble_campaign_package| CA
-    MA -->|publish_instagram_live / draft| PG
-
-    PEP -->|AuthorizationRequest| PDP
-    PDP -->|Allow / Deny| PEP
-    PEP -->|log decision| AL
-
     MA -->|spawn + DelegationRecord| RSA
     MA -->|spawn + DelegationRecord| MSA
-
-    RSA -->|search_sources, fetch_article, extract_claims| PEP
-    MSA -->|generate_campaign_image, draft_instagram_caption| PEP
-
+    MA -->|assemble_campaign_package| CA
     CA -->|CampaignPackage| PG
-    PG -->|publish decision| AL
+
+    MA -.->|authorize inline| MA
+    RSA -.->|authorize inline| RSA
+    MSA -.->|authorize inline| MSA
+    PG -.->|authorize inline| PG
+
+    PS -->|policy store loaded at init| MA
+    PS -->|policy store loaded at init| RSA
+    PS -->|policy store loaded at init| MSA
+    PS -->|policy store loaded at init| PG
+    PS -->|policy store loaded at init| UI
+
+    MA -->|decision logs| AL
+    RSA -->|decision logs| AL
+    MSA -->|decision logs| AL
+    PG -->|decision logs| AL
     PG -->|live post| IG
 
     AL -->|audit entries| UI
-    PDP -.->|policy eval events| UI
 ```
 
 ### Request Flow
 
-Every tool call follows this path:
+Each component authorizes inline before acting:
 
 ```
-Agent → PEP.intercept(tool, args, principal)
-         → PDP.authorize(principal, action, resource, context)
-         → Allow: PEP forwards to tool implementation → result returned to agent
-         → Deny:  PEP returns DenialResponse → MainAgent treats as replanning signal
-         → PEP appends AuditEntry regardless of decision
+component.executeAction(principal, action, resource, context):
+  decision = cedarling.authorize(principal, action, resource, context)
+  if decision.deny:
+    log decision to AuditLog
+    return DenialResponse(diagnostics: decision.diagnostics)
+  log decision to AuditLog
+  return toolImplementation(args)
 ```
 
-The MainAgent begins every campaign run by calling `query_authorization_constraints` (TPE endpoint) to discover what the policy permits *before* constructing a plan. This prevents the agent from proposing actions it cannot execute.
+The MainAgent begins every campaign run by calling `cedarling.authorize` for
+QueryConstraints (TPE) to discover what the policy permits before constructing
+a plan. This prevents the agent from proposing actions it cannot execute.
+
+Each Cedarling instance is initialized at component startup with the shared
+policy store. Decision logs are retrieved from the Cedarling's internal log
+interface and forwarded to the central AuditLog after each decision.
 
 ---
 
@@ -85,36 +94,29 @@ interface MainAgent {
 }
 ```
 
-### PEP (Policy Enforcement Point)
+### Cedarling (Embedded PDP)
 
-Intercepts every tool call. Wraps all tool implementations. Never bypassed.
-
-```typescript
-interface PEP {
-  intercept(
-    principal: Principal,
-    action: Action,
-    resource: Resource,
-    context: PolicyContext,
-    toolFn: () => Promise<unknown>
-  ): Promise<ToolResult | DenialResponse>;
-}
-```
-
-### PDP (Policy Decision Point)
-
-The Cedar engine. Evaluates `AuthorizationRequest` against loaded Cedar policies and entity data.
+Each component embeds its own Cedarling instance, initialized at startup with the shared policy store. Authorization is evaluated in-process — no network hop, no external service dependency.
 
 ```typescript
-interface PDP {
+interface EmbeddedCedarling {
+  // Evaluate a Cedar policy decision inline.
+  // Called directly by the component before executing any action.
   authorize(req: AuthorizationRequest): Promise<AuthorizationDecision>;
+
+  // Query applicable constraints using Typed Partial Evaluation (TPE).
+  // Used by MainAgent during planning phase.
   queryConstraints(principal: Principal, action: Action): Promise<ConstraintSet>;
+
+  // Retrieve decision logs from the Cedarling's internal log cache.
+  // Called after each decision to forward entries to the central AuditLog.
+  getLogs(): AuditEntry[];
 }
 ```
 
 ### ResearchSubAgent
 
-Bounded to: `search_sources`, `fetch_article`, `extract_claims`. All calls routed through PEP.
+Bounded to: `search_sources`, `fetch_article`, `extract_claims`. Calls `cedarling.authorize(...)` inline before each tool execution.
 
 ```typescript
 interface ResearchSubAgent {
@@ -124,7 +126,7 @@ interface ResearchSubAgent {
 
 ### MediaSubAgent
 
-Bounded to: `generate_campaign_image`, `draft_instagram_caption`. All calls routed through PEP.
+Bounded to: `generate_campaign_image`, `draft_instagram_caption`. Calls `cedarling.authorize(...)` inline before each tool execution.
 
 ```typescript
 interface MediaSubAgent {
@@ -163,7 +165,7 @@ interface PublishGate {
 
 ### Audit Log
 
-Append-only. Accepts entries from PEP and Publish Gate. Streams to Browser UI.
+Append-only. Accepts decision log entries forwarded from each component's embedded Cedarling instance after every authorization decision. Streams to Browser UI.
 
 ```typescript
 interface AuditLog {
@@ -863,17 +865,17 @@ when {
 
 ---
 
-### Property 3: PEP Intercepts Every Tool Call
+### Property 3: Cedarling Consulted Before Every Action
 
-*For any* tool invocation by any principal (MainAgent, ResearchSubAgent, or MediaSubAgent), the PEP must consult the PDP and receive an `AuthorizationDecision` before the tool implementation executes. No tool may run without a prior PDP evaluation.
+*For any* action attempted by any component (MainAgent, ResearchSubAgent, or MediaSubAgent), the component's embedded Cedarling instance must be called and return an `AuthorizationDecision` before the action executes. No action may proceed without a prior in-process Cedarling evaluation.
 
 **Validates: Requirements 2.1**
 
 ---
 
-### Property 4: PEP Routes Correctly on Allow and Deny
+### Property 4: Components Route Correctly on Allow and Deny
 
-*For any* tool call where the PDP returns `Allow`, the tool implementation must be called and its result returned. *For any* tool call where the PDP returns `Deny`, the tool implementation must not be called and a `DenialResponse` must be returned instead.
+*For any* action where Cedarling returns `Allow`, the action implementation must be called and its result returned. *For any* action where Cedarling returns `Deny`, the action implementation must not be called and a `DenialResponse` must be constructed from Cedarling diagnostics.
 
 **Validates: Requirements 2.2, 2.3**
 
@@ -887,9 +889,9 @@ when {
 
 ---
 
-### Property 6: Every Tool Call Produces an Audit Entry
+### Property 6: Every Action Produces an Audit Entry
 
-*For any* tool call intercepted by the PEP (regardless of Allow or Deny), exactly one `AuthorizationAuditEntry` must be appended to the audit log containing the principal, action, resource, decision, and timestamp.
+*For any* action evaluated by any embedded Cedarling instance (regardless of Allow or Deny), exactly one `AuthorizationAuditEntry` must be forwarded to the central audit log containing the principal, action, resource, decision, and timestamp.
 
 **Validates: Requirements 2.5, 10.1**
 
@@ -1041,9 +1043,9 @@ when {
 
 ## Error Handling
 
-### PEP Denial Handling
+### Cedarling Denial Handling
 
-When the PDP returns `Deny`, the PEP constructs a `DenialResponse` with:
+When the embedded Cedarling returns `Deny`, the component constructs a `DenialResponse` from the Cedarling diagnostics with:
 - The denial reason from Cedar diagnostics
 - `approvedAlternatives` populated where applicable (e.g., `['PublishDraft']` when `PublishLive` is denied)
 - `approvedDomains` populated when the denial is domain-related
@@ -1060,11 +1062,11 @@ No plan is constructed and no subagents are spawned.
 
 ### Expired DelegationRecord
 
-When the PDP detects an expired TTL, it returns `Deny` with `reason: 'delegation_expired'`. The PEP propagates this as a `DenialResponse`. The MainAgent may re-delegate with a fresh `DelegationRecord` if the campaign is still in progress.
+When the PDP detects an expired TTL, it returns `Deny` with `reason: 'delegation_expired'`. The component's embedded Cedarling propagates this as a `DenialResponse`. The MainAgent may re-delegate with a fresh `DelegationRecord` if the campaign is still in progress.
 
 ### Domain Not Approved
 
-When a research tool call targets an unapproved domain, the PEP returns a `DenialResponse` with `approvedDomains` populated. The ResearchSubAgent must select a different source from the approved list.
+When a research tool call targets an unapproved domain, the ResearchSubAgent's embedded Cedarling returns a `DenialResponse` with `approvedDomains` populated. The ResearchSubAgent must select a different source from the approved list.
 
 ### Assembly with No Claims
 
@@ -1121,10 +1123,10 @@ Each test must be tagged with a comment in this format:
 |----------|-----------------|
 | P1 | For any goal, constraints are queried before plan construction |
 | P2 | For any constraint set, plan actions ⊆ allowedActions |
-| P3 | For any tool call, PDP is consulted before tool executes |
-| P4 | Allow → tool called; Deny → tool not called |
+| P3 | For any action, embedded Cedarling is consulted before action executes |
+| P4 | Allow → action called; Deny → action not called, DenialResponse constructed |
 | P5 | For any denial, replan is invoked |
-| P6 | For any tool call, audit log grows by exactly 1 |
+| P6 | For any action evaluated by any embedded Cedarling, audit log grows by exactly 1 |
 | P7 | For any subagent type, delegation scope equals expected action set |
 | P8 | For any out-of-scope action, DelegationRecord causes Deny |
 | P9 | For any expired DelegationRecord, all calls denied |
@@ -1148,7 +1150,8 @@ Each test must be tagged with a comment in this format:
 
 Unit tests focus on:
 
-- **Integration**: MainAgent full loop with mocked PDP (happy path, overreach scenario, confinement scenario)
+- **Integration**: MainAgent full loop with mocked Cedarling instances (happy path, overreach scenario, confinement scenario) — Cedarling is injected as a dependency, making it trivially mockable in unit tests without any external infrastructure
+- **Embedded authorization**: each component's authorize call is tested as a plain function call — no mocks of external services required, Cedarling evaluates policies locally
 - **Edge cases**: empty constraint set halts planning; zero-claim assembly; TTL boundary (expires exactly now)
 - **Error conditions**: PDP unreachable; Cedarling WASM load failure; Instagram API error after Allow
 - **Demo scenarios**: explicit tests for the three named demo scenarios (Governed, Overreach Blocked, Subagent Confinement)
