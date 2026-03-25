@@ -29,14 +29,15 @@ The core insight: Clawdia is safe not because of prompting, but because authorit
 
 ### Requirement 1: Policy-Constrained Agent Planning
 
-**User Story:** As a campaign operator, I want Clawdia to query applicable policy constraints before planning any action, so that the agent plans within policy rather than reacting to denials.
+**User Story:** As a campaign operator, I want Clawdia to have policy constraints embedded in its system prompt at initialization, so that the agent plans within policy from the start without spending tokens on a separate constraint-query round-trip.
 
 #### Acceptance Criteria
 
-1. WHEN the MainAgent receives a campaign goal, THE MainAgent SHALL invoke `query_authorization_constraints` before constructing any execution plan
-2. THE MainAgent SHALL incorporate the returned constraints (allowed sources, permitted tools, publishing requirements) into its plan before delegating to subagents
-3. IF `query_authorization_constraints` returns an error or empty constraint set, THEN THE MainAgent SHALL halt planning and return a structured error to the caller
-4. THE MainAgent SHALL NOT propose any action in its plan that is not permitted by the retrieved constraints
+1. WHEN the MainAgent initializes, THE MCP Server SHALL call `cedarling.get_policies(principal, actions)` to retrieve applicable policies from the `.cjar` policy store, extract `@description` annotations (using an LLM fallback for policies without `@description`), and inject the assembled constraints into the MainAgent's system prompt
+2. THE MCP Server SHALL expose a simplified function to the LLM that abstracts the policy retrieval and constraint assembly — the LLM SHALL NOT have direct access to `cedarling.get_policies()`
+3. IF the MCP Server fails to retrieve policies or the policy set is empty, THEN THE MainAgent SHALL halt planning and return a structured error to the caller
+4. THE MainAgent SHALL NOT propose any action in its plan that is not permitted by the system-prompt constraints
+5. Every tool call SHALL still be authorized inline by the embedded Cedarling instance (see Requirement 2), so enforcement remains deterministic regardless of what the LLM plans
 
 ---
 
