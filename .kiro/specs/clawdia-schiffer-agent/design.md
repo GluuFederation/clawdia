@@ -7,7 +7,7 @@ Clawdia Schiffer is a policy-governed activist AI agent that campaigns against b
 The architecture demonstrates four key patterns:
 
 1. **Policy Inside the Loop** — the agent cannot act without authorization; denials are replanning signals, not crashes
-2. **Constraints Before Action** — Typed Partial Evaluation (TPE) lets the agent query what it *can* do before planning what it *will* do
+2. **Constraints Before Action** — at initialization, `cedarling.get_policies(principal, actions)` retrieves applicable policies; `@description` annotations provide human-readable constraints that are injected into the agent's system prompt, so the agent plans within policy from the start — without spending tokens on a separate constraint-query round-trip. Policies without `@description` are described by an LLM fallback. Every tool call is still authorized inline by the embedded Cedarling (see pattern 1), so enforcement remains deterministic regardless of what the LLM plans
 3. **Delegation as Data** — subagent authority is an explicit `DelegationRecord` stored and enforced by the same PDP, not a copied capability
 4. **Frontal Lobes for AI** — the Publish Gate uses deterministic Cedar policy to decide live vs. draft, removing LLM judgment from the critical path
 
@@ -69,9 +69,15 @@ component.executeAction(principal, action, resource, context):
   return toolImplementation(args)
 ```
 
-The MainAgent begins every campaign run by calling `cedarling.authorize` for
-QueryConstraints (TPE) to discover what the policy permits before constructing
-a plan. This prevents the agent from proposing actions it cannot execute.
+At initialization, the application calls `cedarling.get_policies(principal, actions)` to retrieve
+all policies with their annotations and source code. Policies with `@description`
+annotations provide human-readable constraint descriptions directly; policies
+without `@description` are passed to an LLM to generate descriptions. The
+collected constraints are injected into the MainAgent's system prompt, so the
+agent plans within policy from the start — without spending tokens on a separate
+MCP constraint-query call. This is a planning optimization only; it does not
+weaken enforcement. Every tool call is still authorized inline by the
+component's embedded Cedarling before execution.
 
 Each Cedarling instance is initialized at component startup with the shared
 policy store. Decision logs are retrieved from the Cedarling's internal log
@@ -83,12 +89,16 @@ interface and forwarded to the central AuditLog after each decision.
 
 ### MainAgent
 
-The primary orchestrating agent. Implements the OpenClaw-style loop: query constraints → plan → delegate → assemble → publish.
+The primary orchestrating agent. Implements the loop: plan → delegate → assemble → publish. Policy constraints are injected into the system prompt at initialization (see `buildSystemPrompt`), so the agent plans within policy from the start. Every tool call is still authorized inline by the embedded Cedarling.
 
 ```typescript
 interface MainAgent {
   run(goal: CampaignGoal): Promise<CampaignResult>;
-  queryConstraints(): Promise<ConstraintSet>;
+  // buildSystemPrompt takes constraint descriptions derived from policy
+  // @description annotations (via ConstraintBuilder.buildConstraintPrompt)
+  // and embeds them into the agent's system prompt. This replaces a runtime
+  // query_authorization_constraints MCP call — zero extra tokens.
+  buildSystemPrompt(constraintPrompt: string): string;
   delegate(subagent: SubAgentType, scope: DelegationScope): Promise<DelegationRecord>;
   replan(denial: DenialResponse, currentPlan: Plan): Promise<Plan>;
 }
@@ -104,13 +114,55 @@ interface EmbeddedCedarling {
   // Called directly by the component before executing any action.
   authorize(req: AuthorizationRequest): Promise<AuthorizationDecision>;
 
-  // Query applicable constraints using Typed Partial Evaluation (TPE).
-  // Used by MainAgent during planning phase.
-  queryConstraints(principal: Principal, action: Action): Promise<ConstraintSet>;
+  // Return policies from the loaded .cjar policy store that apply to the
+  // given principal (or tokens) and action(s). Each entry contains the
+  // policy ID, a map of annotations (including @description if present),
+  // and the policy source code in Cedar or JSON.
+  // Called at MainAgent init to build the system prompt from @description.
+  get_policies(
+    principal: Principal | TokenSet,
+    actions: Action[]
+  ): PolicyInfo[];
 
   // Retrieve decision logs from the Cedarling's internal log cache.
   // Called after each decision to forward entries to the central AuditLog.
   getLogs(): AuditEntry[];
+}
+
+interface PolicyInfo {
+  id: string;                          // value of @id annotation
+  annotations: Record<string, string>; // all annotations, e.g. { ai_advice: "...", id: "..." }
+  source: string;                      // Cedar source code of the policy
+  format: 'cedar' | 'json';           // cedar preferred
+}
+```
+
+### Building the System Prompt from Policy Annotations
+
+The Policy Store is a `.cjar` file containing Cedar policies, schema, and
+trusted IDP configuration. It is loaded once at startup by every Cedarling
+instance.
+
+At MainAgent initialization, the application calls `cedarling.get_policies(principal, actions)`
+to retrieve all policies with their annotations and source code. For each
+policy:
+
+1. If the policy has an `@description` annotation — use its value directly as a
+   human-readable constraint for the system prompt.
+2. If the policy has no `@description` — pass the Cedar source code to an LLM to
+   generate a natural-language description of the constraint.
+
+The collected constraint descriptions are assembled into the MainAgent's system
+prompt, so the agent plans within policy from the start. No separate MCP
+constraint-query call is needed — zero extra tokens at runtime.
+
+```typescript
+interface ConstraintBuilder {
+  // Takes the PolicyInfo[] returned by cedarling.get_policies(principal, actions),
+  // extracts @description annotations, and falls back to LLM description for
+  // policies without @description. Returns assembled constraint text for the
+  // system prompt.
+  buildConstraintPrompt(policies: PolicyInfo[]): Promise<string>;
 }
 ```
 
@@ -214,7 +266,6 @@ interface ApproverIdentity {
 
 ```typescript
 type Action =
-  | 'QueryConstraints'
   | 'DelegateAuthorization'
   | 'Search'
   | 'Fetch'
@@ -476,14 +527,6 @@ namespace Clawdia {
   // ── Actions ───────────────────────────────────────────────────────────────
 
   // MainAgent-only orchestration actions
-  action QueryConstraints appliesTo {
-    principal: Agent,
-    resource: ToolResource,
-    context: {
-      currentTime: Long,
-    }
-  };
-
   action DelegateAuthorization appliesTo {
     principal: Agent,
     resource: ToolResource,
@@ -592,13 +635,11 @@ namespace Clawdia {
 ### Policies
 
 ```cedar
-// ── Policy 1: MainAgent Base Permissions ─────────────────────────────────
-// MainAgent is permitted to perform all orchestration-level actions.
-// Subagents are excluded by the agentType guard.
+@id("policy-001")
+@description("You (MainAgent) may delegate authorization, assemble campaigns, and publish (draft or live).")
 permit (
   principal is Clawdia::Agent,
   action in [
-    Clawdia::Action::"QueryConstraints",
     Clawdia::Action::"DelegateAuthorization",
     Clawdia::Action::"Assemble",
     Clawdia::Action::"PublishDraft",
@@ -611,9 +652,8 @@ when {
 };
 
 
-// ── Policy 2: ResearchSubAgent Base Permissions ───────────────────────────
-// ResearchSubAgent may perform research actions only when a valid
-// DelegationRecord is present and the action is in its permitted scope.
+@id("policy-002")
+@description("ResearchSubAgent may only Search, Fetch, and Extract — and only when it has a valid delegation.")
 permit (
   principal is Clawdia::Agent,
   action in [
@@ -630,9 +670,8 @@ when {
 };
 
 
-// ── Policy 3: MediaSubAgent Base Permissions ──────────────────────────────
-// MediaSubAgent may perform media production actions only when a valid
-// DelegationRecord is present and the action is in its permitted scope.
+@id("policy-003")
+@description("MediaSubAgent may only GenerateImage and DraftCaption — and only when it has a valid delegation.")
 permit (
   principal is Clawdia::Agent,
   action in [
@@ -648,9 +687,8 @@ when {
 };
 
 
-// ── Policy 4: Delegation TTL Enforcement ─────────────────────────────────
-// Deny any subagent action when the DelegationRecord has expired.
-// currentTime and delegationExpiresAt are Unix timestamps (Long).
+@id("policy-004")
+@description("Subagent delegations expire. Once the TTL is past, all subagent tool calls are denied.")
 forbid (
   principal is Clawdia::Agent,
   action in [
@@ -668,10 +706,8 @@ when {
 };
 
 
-// ── Policy 5: Delegation Scope Enforcement ────────────────────────────────
-// Deny any subagent action that is not listed in the DelegationRecord's
-// permittedActions set. This is a belt-and-suspenders guard on top of
-// the permit rules above — an action not in scope is explicitly forbidden.
+@id("policy-005")
+@description("Subagents can only perform actions listed in their DelegationRecord. Anything else is denied.")
 forbid (
   principal is Clawdia::Agent,
   action in [
@@ -689,10 +725,8 @@ when {
 };
 
 
-// ── Policy 6: Domain Allowlist Enforcement ────────────────────────────────
-// Deny Search and Fetch when the requested domain is not in the approved
-// list. The approved domains are enumerated explicitly; any domain not
-// listed here is denied regardless of other policy.
+@id("policy-006")
+@description("Research is restricted to approved domains only: fisheries.noaa.gov, fao.org, ices.dk, ipbes.net, oceana.org, wwf.org, mcsuk.org, edf.org, scholar.google.com, sciencedirect.com. All other domains are denied.")
 forbid (
   principal is Clawdia::Agent,
   action in [
@@ -717,11 +751,8 @@ when {
 };
 
 
-// ── Policy 7: Live Publish — Confidence Threshold ─────────────────────────
-// Deny PublishLive when the campaign package's confidence score is below
-// the 0.8 threshold. The score is passed in context because Cedar entity
-// attributes on the resource are also acceptable, but context is used here
-// to match the PolicyContext shape defined in the data model.
+@id("policy-007")
+@description("Live publishing requires a confidence score of at least 0.8. Below that threshold, publish as draft instead.")
 forbid (
   principal is Clawdia::Agent,
   action == Clawdia::Action::"PublishLive",
@@ -732,8 +763,8 @@ when {
 };
 
 
-// ── Policy 8: Live Publish — Unverified Claims ────────────────────────────
-// Deny PublishLive when the package contains any claim without a citation.
+@id("policy-008")
+@description("Live publishing is denied if any claim lacks a citation. All claims must be verified before going live.")
 forbid (
   principal is Clawdia::Agent,
   action == Clawdia::Action::"PublishLive",
@@ -744,12 +775,8 @@ when {
 };
 
 
-// ── Policy 9a: Live Publish — Approver Must Be from account.gluu.org ──────
-// ARC-style policy: principal is unconstrained. The decision is made
-// purely on context token claims — not on who the principal is.
-// Deny PublishLive when the approver's tokens were not issued by
-// account.gluu.org. An empty or absent approverIss signals no valid
-// approver token is present.
+@id("policy-009a")
+@description("Live publishing requires a human approver whose tokens were issued by account.gluu.org.")
 forbid (
   principal,
   action == Clawdia::Action::"PublishLive",
@@ -761,11 +788,8 @@ when {
 };
 
 
-// ── Policy 9b: Live Publish — Approver Must Have clawdia-admin Role ───────
-// ARC-style policy: principal is unconstrained. Role is evaluated from
-// the userinfo_token claim in context, not from principal attributes.
-// Deny PublishLive when the userinfo_token does not carry the
-// clawdia-admin role claim. Role must be an exact string match.
+@id("policy-009b")
+@description("Live publishing requires the human approver to have the clawdia-admin role.")
 forbid (
   principal,
   action == Clawdia::Action::"PublishLive",
@@ -777,11 +801,8 @@ when {
 };
 
 
-// ── Policy 9c: Live Publish — Approver Tokens Must Not Be Expired ─────────
-// ARC-style policy: principal is unconstrained. Token expiry is evaluated
-// from context timestamps, not from principal identity.
-// Deny PublishLive when either the id_token or the userinfo_token has
-// expired. Both must be valid at the time of the publish request.
+@id("policy-009c")
+@description("Live publishing is denied if the approver's id_token or userinfo_token has expired.")
 forbid (
   principal,
   action == Clawdia::Action::"PublishLive",
@@ -796,10 +817,8 @@ when {
 };
 
 
-// ── Policy 10: Draft Publish Always Allowed ───────────────────────────────
-// PublishDraft is unconditionally permitted for MainAgent. This is already
-// covered by Policy 1, but is stated explicitly here as a named policy so
-// the intent is unambiguous and auditable.
+@id("policy-010")
+@description("Draft publishing is always allowed for MainAgent — no confidence threshold or approval needed.")
 permit (
   principal is Clawdia::Agent,
   action == Clawdia::Action::"PublishDraft",
@@ -810,9 +829,8 @@ when {
 };
 
 
-// ── Policy 11: Subagent Confinement — Research Cannot Publish ─────────────
-// Explicitly forbid ResearchSubAgent from attempting any publish action.
-// This is a hard confinement rule; no delegation can override a forbid.
+@id("policy-011")
+@description("ResearchSubAgent is forbidden from publishing (draft or live). This is a hard confinement rule.")
 forbid (
   principal is Clawdia::Agent,
   action in [
@@ -826,10 +844,8 @@ when {
 };
 
 
-// ── Policy 12: Subagent Confinement — Media Cannot Research ───────────────
-// Explicitly forbid MediaSubAgent from attempting any research action.
-// Same rationale as Policy 11 — confinement is enforced at the policy
-// layer, not just by the absence of a permit rule.
+@id("policy-012")
+@description("MediaSubAgent is forbidden from research actions (Search, Fetch). This is a hard confinement rule.")
 forbid (
   principal is Clawdia::Agent,
   action in [
@@ -849,9 +865,9 @@ when {
 
 *A property is a characteristic or behavior that should hold true across all valid executions of a system — essentially, a formal statement about what the system should do. Properties serve as the bridge between human-readable specifications and machine-verifiable correctness guarantees.*
 
-### Property 1: Constraints Queried Before Planning
+### Property 1: Constraints Embedded in System Prompt Before Planning
 
-*For any* campaign goal submitted to the MainAgent, `query_authorization_constraints` must be invoked and return a non-empty ConstraintSet before any execution plan is constructed or any subagent is delegated.
+*For any* MainAgent initialization, `cedarling.get_policies(principal, actions)` must be called and all `@description` annotations (plus LLM-generated descriptions for policies without `@description`) must be assembled into the system prompt before any campaign goal is processed. If `get_policies()` returns an empty list, the MainAgent must not start.
 
 **Validates: Requirements 1.1, 1.2**
 
@@ -1052,13 +1068,13 @@ When the embedded Cedarling returns `Deny`, the component constructs a `DenialRe
 
 The MainAgent's `replan` function inspects `approvedAlternatives` to select the next action. If no alternatives exist, the agent returns a structured `CampaignResult` with `status: 'blocked'`.
 
-### Constraint Query Failure
+### Constraint Loading Failure
 
-If `query_authorization_constraints` returns an error or empty `ConstraintSet`, the MainAgent halts immediately and returns:
+If `cedarling.get_policies(principal, actions)` returns an empty list or fails at initialization, the MainAgent must not start. It returns:
 ```typescript
-{ status: 'error', reason: 'constraint_query_failed', details: error }
+{ status: 'error', reason: 'constraint_load_failed', details: error }
 ```
-No plan is constructed and no subagents are spawned.
+No plan is constructed and no subagents are spawned. If some policies lack `@description` and the LLM fallback also fails, those policies are logged as warnings but the MainAgent may still start with the constraints it could resolve.
 
 ### Expired DelegationRecord
 
@@ -1121,7 +1137,7 @@ Each test must be tagged with a comment in this format:
 
 | Property | Test Description |
 |----------|-----------------|
-| P1 | For any goal, constraints are queried before plan construction |
+| P1 | For any MainAgent init, system prompt contains full ConstraintSet from policy store |
 | P2 | For any constraint set, plan actions ⊆ allowedActions |
 | P3 | For any action, embedded Cedarling is consulted before action executes |
 | P4 | Allow → action called; Deny → action not called, DenialResponse constructed |
@@ -1152,8 +1168,8 @@ Unit tests focus on:
 
 - **Integration**: MainAgent full loop with mocked Cedarling instances (happy path, overreach scenario, confinement scenario) — Cedarling is injected as a dependency, making it trivially mockable in unit tests without any external infrastructure
 - **Embedded authorization**: each component's authorize call is tested as a plain function call — no mocks of external services required, Cedarling evaluates policies locally
-- **Edge cases**: empty constraint set halts planning; zero-claim assembly; TTL boundary (expires exactly now)
-- **Error conditions**: PDP unreachable; Cedarling WASM load failure; Instagram API error after Allow
+- **Edge cases**: empty constraint set prevents MainAgent startup; zero-claim assembly; TTL boundary (expires exactly now)
+- **Error conditions**: policy store load failure; Cedarling WASM load failure; Instagram API error after Allow
 - **Demo scenarios**: explicit tests for the three named demo scenarios (Governed, Overreach Blocked, Subagent Confinement)
 
 ### Cedar Policy Tests
